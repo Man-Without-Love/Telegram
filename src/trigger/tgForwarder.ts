@@ -3,6 +3,7 @@ import { python } from "@trigger.dev/python";
 
 export const tgForwarderTask = task({
   id: "tg-forwarder",
+  ttl: "1h", // Время ожидания в очереди (например: "30m", "1h", "6h", "1d", до 14d)
   queue: {
     name: "tg_forwarding_group",
     concurrencyLimit: 1,
@@ -28,4 +29,3 @@ export const tgForwarderTask = task({
     return { exitCode: result.exitCode };
   },
 });
-      
