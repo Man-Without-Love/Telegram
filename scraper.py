@@ -1,5 +1,4 @@
 import os
-import time
 import asyncio
 import smtplib
 import ssl
@@ -14,11 +13,11 @@ from telethon.tl.types import MessageMediaPoll, MessageEntityTextUrl
 
 
 def get_env(name: str, default: str = "") -> str:
-    """Читает переменную из MORPH_<NAME> или <NAME>."""
-    return os.getenv(f"MORPH_{name}") or os.getenv(name) or default
+    """Читает переменную окружения."""
+    return os.getenv(name) or os.getenv(f"MORPH_{name}") or default
 
 
-# --- НАСТРОЙКИ ИЗ ОКРУЖЕНИЯ (MORPH_* или обычные env) ---
+# --- НАСТРОЙКИ ИЗ ENVIRONMENT VARIABLES НА RENDER ---
 API_ID = int(get_env("TG_API_ID", "0"))
 API_HASH = get_env("TG_API_HASH")
 SESSION_STRING = get_env("TG_SESSION")
@@ -33,30 +32,17 @@ MAX_EMAIL_SIZE = 24 * 1024 * 1024  # 24 МБ (безопасный порог д
 # Прямая ссылка на RAW-версию твоего Gist со списком VPN-каналов
 VPN_GIST_URL = get_env("VPN_GIST_URL", "")
 
-# Интервал опроса каналов (сек) и лимит работы до плановой остановки (1 час = 3600 сек)
-POLL_INTERVAL = int(get_env("POLL_INTERVAL", "60"))
-MAX_RUN_SECONDS = int(get_env("MAX_RUN_SECONDS", "3600"))
+# Опциональный секретный ключ для URL (если задашь CRON_SECRET, вызывать нужно /run?key=...)
+CRON_SECRET = get_env("CRON_SECRET", "")
+
+# Порт, который автоматически назначает Render
+PORT = int(os.getenv("PORT", "10000"))
 
 RAM_PATH = os.path.join(os.getcwd(), "temp_media")
 os.makedirs(RAM_PATH, exist_ok=True)
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 mail_queue = asyncio.Queue()
-
-# Счётчик активных операций (скачивание медиа / отправка писем)
-active_tasks = 0
-state_lock = asyncio.Lock()
-
-
-async def mark_busy(delta: int):
-    global active_tasks
-    async with state_lock:
-        active_tasks = max(0, active_tasks + delta)
-
-
-async def is_idle() -> bool:
-    async with state_lock:
-        return active_tasks == 0 and mail_queue.empty()
+job_lock = asyncio.Lock()
 
 
 async def fetch_vpn_channels_list():
@@ -88,7 +74,6 @@ async def fetch_vpn_channels_list():
 async def send_mail_worker():
     while not mail_queue.empty():
         subject, html_body, files = await mail_queue.get()
-        await mark_busy(1)
         try:
             msg = EmailMessage()
             msg["Subject"] = subject
@@ -121,7 +106,6 @@ async def send_mail_worker():
         except Exception as e:
             print(f"❌ Ошибка SMTP: {e}")
         finally:
-            await mark_busy(-1)
             mail_queue.task_done()
 
 
@@ -148,7 +132,7 @@ def get_html_text(msg):
     return html_text.replace("\n", "<br>")
 
 
-async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
+async def process_messages(client, messages, chat_entity, vpn_list, mark_read=False):
     if not messages:
         return
     first_msg = messages[0]
@@ -205,26 +189,22 @@ async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
             print(f"⚠️ Файл {f_name} ({round(file_size / (1024*1024), 2)} МБ) превышает лимит почты. Пропускаем.")
             media_html += f'<br><p style="color: #888;">⚠️ <i>Вложение пропущено (превышен лимит 25 МБ): {f_name}</i></p>'
         else:
-            await mark_busy(1)
-            try:
-                path = await msg.download_media(file=RAM_PATH)
-                if path and os.path.exists(path):
-                    f_name = os.path.basename(path)
-                    cid = str(uuid.uuid4())
-                    with open(path, "rb") as f:
-                        f_data = f.read()
+            path = await msg.download_media(file=RAM_PATH)
+            if path and os.path.exists(path):
+                f_name = os.path.basename(path)
+                cid = str(uuid.uuid4())
+                with open(path, "rb") as f:
+                    f_data = f.read()
 
-                    files.append((f_data, f_name, cid))
-                    os.remove(path)
+                files.append((f_data, f_name, cid))
+                os.remove(path)
 
-                    if f_name.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
-                        media_html += f'<br><img src="cid:{cid}" style="max-width: 100%;"><br>'
-                    elif f_name.lower().endswith((".mp3", ".ogg", ".wav", ".m4a")):
-                        media_html += f'<br><p>🎵 Аудиофайл: {f_name}</p>'
-                    else:
-                        media_html += f'<br><p>📎 Вложение: {f_name}</p>'
-            finally:
-                await mark_busy(-1)
+                if f_name.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+                    media_html += f'<br><img src="cid:{cid}" style="max-width: 100%;"><br>'
+                elif f_name.lower().endswith((".mp3", ".ogg", ".wav", ".m4a")):
+                    media_html += f'<br><p>🎵 Аудиофайл: {f_name}</p>'
+                else:
+                    media_html += f'<br><p>📎 Вложение: {f_name}</p>'
 
     local_time = first_msg.date + timedelta(hours=5)
     pub_date = local_time.strftime("%d.%m.%Y %H:%M:%S")
@@ -277,58 +257,120 @@ async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
         await client.send_read_acknowledge(first_msg.chat_id, max_id=max(m.id for m in messages))
 
 
-async def poll_once(vpn_list):
-    async for dialog in client.iter_dialogs():
-        if dialog.is_channel and dialog.unread_count > 0:
-            print(f"📥 Читаем {dialog.name}: {dialog.unread_count} новых")
-            chat_entity = await client.get_entity(dialog.id)
-            messages = await client.get_messages(dialog.id, limit=dialog.unread_count)
+async def run_scraper_job():
+    """Разовый полный цикл проверки Telegram и отправки всех писем."""
+    if job_lock.locked():
+        print("⏳ Задача уже выполняется, пропускаем повторный вызов.")
+        return
 
-            grouped = {}
-            ungrouped = []
-            for m in reversed(messages):
-                if m.grouped_id:
-                    grouped.setdefault(m.grouped_id, []).append(m)
-                else:
-                    ungrouped.append([m])
+    async with job_lock:
+        print("🚀 Подключение к Telegram...")
+        vpn_list = await fetch_vpn_channels_list()
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-            all_batches = list(grouped.values()) + ungrouped
-            for i, batch in enumerate(all_batches):
-                should_mark = i == len(all_batches) - 1
-                await process_messages(batch, chat_entity, vpn_list, mark_read=should_mark)
+        try:
+            async with client:
+                async for dialog in client.iter_dialogs():
+                    if dialog.is_channel and dialog.unread_count > 0:
+                        print(f"📥 Читаем {dialog.name}: {dialog.unread_count} новых")
+                        chat_entity = await client.get_entity(dialog.id)
+                        messages = await client.get_messages(dialog.id, limit=dialog.unread_count)
 
-    if not mail_queue.empty():
-        print(f"📧 Начинаем отправку писем ({mail_queue.qsize()} шт.)...")
-        await send_mail_worker()
+                        grouped = {}
+                        ungrouped = []
+                        for m in reversed(messages):
+                            if m.grouped_id:
+                                grouped.setdefault(m.grouped_id, []).append(m)
+                            else:
+                                ungrouped.append([m])
+
+                        all_batches = list(grouped.values()) + ungrouped
+                        for i, batch in enumerate(all_batches):
+                            should_mark = i == len(all_batches) - 1
+                            await process_messages(client, batch, chat_entity, vpn_list, mark_read=should_mark)
+
+            print("🔌 Соединение с Telegram закрыто.")
+
+            if not mail_queue.empty():
+                print(f"📧 Начинаем отправку писем ({mail_queue.qsize()} шт.)...")
+                await send_mail_worker()
+            else:
+                print("📭 Новых постов не найдено.")
+
+            print("💤 Работа завершена. Ждём следующего вызова или засыпания контейнера.")
+        except Exception as e:
+            print(f"❌ Ошибка при выполнении задачи: {e}")
+
+
+async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Минимальный встроенный HTTP-сервер для Render и cron-job.org."""
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        if not request_line:
+            writer.close()
+            return
+
+        # Дочитываем заголовки
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            if not line or line == b"\r\n":
+                break
+
+        parts = request_line.decode("utf-8", errors="ignore").split()
+        path = parts[1] if len(parts) > 1 else "/"
+
+        # Проверка секретного ключа, если он задан в настройках Render
+        if CRON_SECRET and f"key={CRON_SECRET}" not in path:
+            body = b"Forbidden"
+            response = (
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+            writer.write(response)
+            await writer.drain()
+            writer.close()
+            return
+
+        # Запускаем проверку каналов в фоне (не блокируя ответ для cron-job.org)
+        if not path.startswith("/favicon"):
+            if job_lock.locked():
+                body = b"Already running"
+            else:
+                asyncio.create_task(run_scraper_job())
+                body = b"Started"
+        else:
+            body = b"OK"
+
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 async def main():
-    start_time = time.monotonic()
-    print("🚀 Запуск парсера на morph.io...")
-    vpn_list = await fetch_vpn_channels_list()
-
-    async with client:
-        print("🔌 Подключено к Telegram.")
-        while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed >= MAX_RUN_SECONDS:
-                if await is_idle():
-                    print("⏱️ Прошёл 1 час, активных задач нет. Останавливаемся.")
-                    break
-                else:
-                    print("⏱️ Прошёл 1 час, но идёт скачивание или отправка. Ждём завершения...")
-
-            await poll_once(vpn_list)
-
-            if (time.monotonic() - start_time) >= MAX_RUN_SECONDS and await is_idle():
-                print("⏱️ Задачи завершены после истечения часа. Останавливаемся.")
-                break
-
-            await asyncio.sleep(POLL_INTERVAL)
-
-    print("🔌 Соединение с Telegram закрыто.")
-    print("💤 Скрипт завершен.")
+    # При пробуждении контейнера от внешнего запроса сразу запускаем проверку и поднимаем порт
+    server = await asyncio.start_server(handle_http_request, "0.0.0.0", PORT)
+    print(f"🌐 HTTP-сервер запущен на порту {PORT} и готов принимать запросы от cron-job.org")
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+        
