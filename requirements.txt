@@ -1,4 +1,3 @@
-apify
 telethon
 cryptg
 httpx
