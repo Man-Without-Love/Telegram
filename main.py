@@ -30,7 +30,7 @@ RAM_PATH = os.path.join(os.getcwd(), 'temp_media')
 os.makedirs(RAM_PATH, exist_ok=True)
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-mail_queue = asyncio.Queue()
+sent_emails_count = 0
 
 async def fetch_vpn_channels_list():
     """Загружает список VPN-каналов из GitHub Gist"""
@@ -57,42 +57,39 @@ async def fetch_vpn_channels_list():
     
     return set()
 
-async def send_mail_worker():
-    while not mail_queue.empty():
-        subject, html_body, files = await mail_queue.get()
-        try:
-            msg = EmailMessage()
-            msg['Subject'] = subject
-            msg['From'] = SENDER_EMAIL
-            msg['To'] = RECEIVER_EMAIL
-            msg.set_content("HTML format required.")
-            msg.add_alternative(html_body, subtype='html')
-            
-            for f_data, f_name, cid in files:
-                ctype, _ = mimetypes.guess_type(f_name)
-                ctype = ctype or 'application/octet-stream'
-                maintype, subtype = ctype.split('/', 1)
-                msg.get_payload()[1].add_related(
-                    f_data, 
-                    maintype=maintype, 
-                    subtype=subtype, 
-                    filename=f_name, 
-                    cid=f"<{cid}>"
-                )
+async def send_single_email(subject, html_body, files):
+    """Отправляет одно письмо через SMTP"""
+    global sent_emails_count
+    try:
+        msg = EmailMessage()
+        msg['Subject'] = subject
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg.set_content("HTML format required.")
+        msg.add_alternative(html_body, subtype='html')
+        
+        for f_data, f_name, cid in files:
+            ctype, _ = mimetypes.guess_type(f_name)
+            ctype = ctype or 'application/octet-stream'
+            maintype, subtype = ctype.split('/', 1)
+            msg.get_payload()[1].add_related(
+                f_data, 
+                maintype=maintype, 
+                subtype=subtype, 
+                filename=f_name, 
+                cid=f"<{cid}>"
+            )
 
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
-                server.login(SENDER_EMAIL, SENDER_PASS)
-                server.send_message(msg)
-            
-            print(f"✅ Отправлено: {subject}")
-            
-            if not mail_queue.empty():
-                await asyncio.sleep(5)
-        except Exception as e:
-            print(f"❌ Ошибка SMTP: {e}")
-        finally:
-            mail_queue.task_done()
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+            server.login(SENDER_EMAIL, SENDER_PASS)
+            server.send_message(msg)
+        
+        sent_emails_count += 1
+        print(f"✅ Отправлено: {subject}")
+        await asyncio.sleep(5)
+    except Exception as e:
+        print(f"❌ Ошибка SMTP: {e}")
 
 def get_html_text(msg):
     if not msg: return ""
@@ -113,6 +110,12 @@ def get_html_text(msg):
         
     html_text = msg.text_html if hasattr(msg, 'text_html') and msg.text_html else raw_text
     return html_text.replace('\n', '<br>')
+
+def is_video_message(msg):
+    if getattr(msg, 'video', None) or getattr(msg, 'video_note', None):
+        return True
+    mime_type = getattr(getattr(msg, 'file', None), 'mime_type', '') or ''
+    return mime_type.startswith('video/')
 
 async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
     if not messages: return
@@ -138,10 +141,17 @@ async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
     media_html = ""
     poll_html = ""
 
-    total_size = sum(getattr(msg.file, 'size', 0) for msg in messages if msg.media)
+    non_video_messages = [m for m in messages if m.media and not is_video_message(m)]
+    total_size = sum(getattr(m.file, 'size', 0) for m in non_video_messages)
 
     for msg in messages:
         if not msg.media:
+            continue
+
+        if is_video_message(msg):
+            f_name = getattr(msg.file, 'name', 'video') or 'video'
+            print(f"🎬 Пропускаем видео: {f_name}")
+            media_html += f'<br><p style="color: #888;">🎬 <i>Видео пропущено: {f_name}</i></p>'
             continue
             
         if isinstance(msg.media, MessageMediaPoll):
@@ -234,8 +244,8 @@ async def process_messages(messages, chat_entity, vpn_list, mark_read=False):
     </html>
     """
     
-    # Отправляем в очередь с динамической темой
-    await mail_queue.put((email_subject, html_body, files))
+    # Отправляем пост сразу после подготовки
+    await send_single_email(email_subject, html_body, files)
     
     if mark_read:
         await client.send_read_acknowledge(first_msg.chat_id, max_id=max(m.id for m in messages))
@@ -266,13 +276,11 @@ async def main():
     
     print("🔌 Соединение с Telegram закрыто.")
 
-    if not mail_queue.empty():
-        print(f"📧 Начинаем отправку писем ({mail_queue.qsize()} шт.)...")
-        await send_mail_worker()
-    else:
+    if sent_emails_count == 0:
         print("📭 Новых постов не найдено.")
             
     print("💤 Всё готово. Скрипт завершен.")
 
 if __name__ == '__main__':
     asyncio.run(main())
+            
